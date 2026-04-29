@@ -140,7 +140,14 @@
     #define INTERSECTION_FWD_MS  100  // Drive straight into intersection
 
     // ──────────────────────────────────────────────────────────────
-    //  STATE MACHINE
+    //  GRADUATED SCAN TIMING (milliseconds for each angle degree)
+    //  Calculated from: SCAN_FULL_MS / 150° ≈ 8.33 ms per degree
+    //  Updated for 30° increments: stops at 120°
+    // ──────────────────────────────────────────────────────────────
+    #define SCAN_TIME_30_DEG     250   // ~30° scan
+    #define SCAN_TIME_60_DEG     500   // ~60° scan
+    #define SCAN_TIME_90_DEG     750   // ~90° scan
+    //#define SCAN_TIME_120_DEG    1000  // ~120° scan (maximum)
     // ──────────────────────────────────────────────────────────────
     enum State {
     ST_FOLLOW,          // Normal line following
@@ -168,6 +175,19 @@
     bool recentTurn              = false; // True if we just completed a turn
     unsigned long lineLostTime   = 0; // Track how long line has been lost
     bool lineIsLost              = false; // Immediate sensor loss flag
+
+    // Graduated scan tracking
+    int  scanAngleDegrees  = 30;    // Current scan angle: 30, 60, 90, 120
+    int  scanPhase         = 0;     // 0=scanFirstDir, 1=returnFromFirst, 2=scanSecondDir, 3=returnFromSecond
+    unsigned long scanStartTime = 0; // Start time for current scan phase
+    int  scanFirstDir      = -1;    // Which direction to scan first: -1=left, +1=right
+    int  lastSensorDetected = -1;   // Which sensor LAST detected black: -1=left, +1=right
+    bool finishLineReached  = false; // TRUE = permanent stop, no restart
+
+    // Sensor debouncing
+    int prevL = 0, prevR = 0;       // Previous sensor reads
+    int debounceCount = 0;          // Counter for debounce confirmation
+    bool systemReady = false;       // Flag to prevent startup noise
 
     // ──────────────────────────────────────────────────────────────
     //  MOTOR CONTROL (PWM via IN pins)
@@ -221,10 +241,10 @@
     motorRight(0);
     }
 
-    // Quick-stop: brief reverse pulse then coast
+    // Quick-stop: gentle coast (no reverse pulse - prevents buzzing)
     void hardBrake() {
-    motorLeft(-80);
-    motorRight(-80);
+    motorLeft(0);
+    motorRight(0);
     delay(BRAKE_PULSE_MS);
     stopMotors();
     }
@@ -244,6 +264,16 @@
     void setState(State s) {
     state = s;
     stateStartTime = millis();
+    scanStartTime = millis();  // Also reset scan phase timer
+    }
+
+    // Get scan time in milliseconds for a given angle
+    int getScanTimeForAngle(int angle) {
+    if (angle == 30) return SCAN_TIME_30_DEG;
+    if (angle == 60) return SCAN_TIME_60_DEG;
+    if (angle == 90) return SCAN_TIME_90_DEG;
+  //  if (angle == 120) return SCAN_TIME_120_DEG;
+    return SCAN_TIME_30_DEG;  // default
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -278,16 +308,58 @@
     Serial.println("1...");
     delay(1000);
     Serial.println("GO!");
+    
+    // Stabilization period: let sensors settle for 500ms before starting
+    unsigned long stabilizeStart = millis();
+    while (millis() - stabilizeStart < 500) {
+        digitalRead(IR_LEFT);
+        digitalRead(IR_RIGHT);
+        delay(10);
+    }
+    systemReady = true;  // System is now ready
     }
 
     // ──────────────────────────────────────────────────────────────
     //  MAIN LOOP — STATE MACHINE
     // ──────────────────────────────────────────────────────────────
     void loop() {
-    // Read sensors
+    // Safety check: don't process if system is not ready
+    if (!systemReady) {
+        delay(1);
+        return;
+    }
+    
+    // Read sensors with debouncing to prevent noise-triggered false starts
     int L = digitalRead(IR_LEFT);    // 0 = White, 1 = Black
     int R = digitalRead(IR_RIGHT);
+    
+    // Debounce: require 3 consecutive identical reads before accepting
+    if (L == prevL && R == prevR) {
+        debounceCount++;
+    } else {
+        debounceCount = 0;
+    }
+    prevL = L;
+    prevR = R;
+    
+    // Use sensor values only after debounce threshold is reached
+    if (debounceCount < 3) {
+        L = prevL;  // Use previous stable values until debounce completes
+        R = prevR;
+    }
+    
     unsigned long now = millis();
+
+    // ════════════════════════════════════════════════════════════
+    //  TRACK WHICH SENSOR LAST DETECTED BLACK
+    //  This determines which direction to scan first when line is lost
+    // ════════════════════════════════════════════════════════════
+    if (L == 1 && R == 0) {
+        lastSensorDetected = -1;  // Left sensor was last to see black
+    } else if (L == 0 && R == 1) {
+        lastSensorDetected = 1;   // Right sensor was last to see black
+    }
+    // If both black (1,1) or both white (0,0), keep the previous value
 
     // ════════════════════════════════════════════════════════════
     //  IMMEDIATE SENSOR LOSS DETECTION
@@ -462,49 +534,131 @@
         }
         break;
 
-        // ────────── SCANNING SEQUENCE ──────────
+        // ────────── SCANNING SEQUENCE (GRADUATED) ──────────
+        // Scans toward lastSensorDetected direction FIRST.
+        // Left sensor last saw black → scan left first, then right.
+        // Right sensor last saw black → scan right first, then left.
+        // Increments: 30° → 60° → 90° → 120°.
+        // After 120° exhausted on both sides → PERMANENT STOP (finish line).
         case ST_SCAN_PAUSE:
         stopMotors();
         if (now - stateStartTime > SCAN_PAUSE_MS) {
-            scanStepCount = 0;
-            setState(ST_SCAN_LEFT);
+            scanAngleDegrees = 30;
+            scanPhase = 0;
+            scanStartTime = now;
+            scanFirstDir = lastSensorDetected;  // -1=left first, +1=right first
+            if (scanFirstDir <= 0) {
+                setState(ST_SCAN_LEFT);
+            } else {
+                setState(ST_SCAN_RIGHT);
+            }
         }
         // If line appears during pause, go back to follow
         if (L == 1 || R == 1) setState(ST_FOLLOW);
         break;
 
         case ST_SCAN_LEFT: {
-        // Turn left slowly
-        motorLeft(-SCAN_SPEED);
-        motorRight(SCAN_SPEED);
-        if (L == 1 || R == 1) setState(ST_FOLLOW);
+        // If scanFirstDir <= 0: left is first (phase 0=scan, 1=return)
+        // If scanFirstDir > 0:  left is second (phase 2=scan, 3=return)
+        int leftBase = (scanFirstDir <= 0) ? 0 : 2;
 
-        // First look is short (from center), subsequent looks are full sweeps
-        int leftLimit = (scanStepCount == 0) ? SCAN_SHORT_MS : SCAN_FULL_MS;
-        if (now - stateStartTime > leftLimit) {
-            scanStepCount++;
-            if (scanStepCount >= SCAN_MAX_STEPS) setState(ST_STOP);
-            else setState(ST_SCAN_RIGHT);
+        if (scanPhase == leftBase) {
+            motorLeft(-SCAN_SPEED);
+            motorRight(SCAN_SPEED);
+            if (L == 1 || R == 1) { stopMotors(); setState(ST_FOLLOW); break; }
+            int scanTime = getScanTimeForAngle(scanAngleDegrees);
+            if (now - scanStartTime > scanTime) {
+                scanPhase = leftBase + 1;
+                scanStartTime = now;
+            }
+        }
+        else if (scanPhase == leftBase + 1) {
+            motorLeft(SCAN_SPEED);
+            motorRight(-SCAN_SPEED);
+            if (L == 1 || R == 1) { stopMotors(); setState(ST_FOLLOW); break; }
+            int returnTime = getScanTimeForAngle(scanAngleDegrees);
+            if (now - scanStartTime > returnTime) {
+                stopMotors();
+                if (scanFirstDir <= 0) {
+                    // Left was first → now scan right (second)
+                    scanPhase = 2;
+                    scanStartTime = now;
+                    setState(ST_SCAN_RIGHT);
+                } else {
+                    // Left was second → both sides done at this angle
+                    if (scanAngleDegrees >= 90) {
+                        finishLineReached = true;
+                        setState(ST_STOP);
+                    } else {
+                        scanAngleDegrees += 30;
+                        scanPhase = 0;
+                        scanStartTime = now;
+                        // scanFirstDir > 0 means right-first, so next cycle starts right
+                        setState(ST_SCAN_RIGHT);
+                    }
+                }
+            }
         }
         break;
         }
 
-        case ST_SCAN_RIGHT:
-        // Turn right (sweep back past center)
-        motorLeft(SCAN_SPEED);
-        motorRight(-SCAN_SPEED);
-        if (L == 1 || R == 1) setState(ST_FOLLOW);
+        case ST_SCAN_RIGHT: {
+        // If scanFirstDir > 0:  right is first (phase 0=scan, 1=return)
+        // If scanFirstDir <= 0: right is second (phase 2=scan, 3=return)
+        int rightBase = (scanFirstDir > 0) ? 0 : 2;
 
-        if (now - stateStartTime > SCAN_FULL_MS) {
-            scanStepCount++;
-            if (scanStepCount >= SCAN_MAX_STEPS) setState(ST_STOP);
-            else setState(ST_SCAN_LEFT);
+        if (scanPhase == rightBase) {
+            motorLeft(SCAN_SPEED);
+            motorRight(-SCAN_SPEED);
+            if (L == 1 || R == 1) { stopMotors(); setState(ST_FOLLOW); break; }
+            int scanTime = getScanTimeForAngle(scanAngleDegrees);
+            if (now - scanStartTime > scanTime) {
+                scanPhase = rightBase + 1;
+                scanStartTime = now;
+            }
+        }
+        else if (scanPhase == rightBase + 1) {
+            motorLeft(-SCAN_SPEED);
+            motorRight(SCAN_SPEED);
+            if (L == 1 || R == 1) { stopMotors(); setState(ST_FOLLOW); break; }
+            int returnTime = getScanTimeForAngle(scanAngleDegrees);
+            if (now - scanStartTime > returnTime) {
+                stopMotors();
+                if (scanFirstDir > 0) {
+                    // Right was first → now scan left (second)
+                    scanPhase = 2;
+                    scanStartTime = now;
+                    setState(ST_SCAN_LEFT);
+                } else {
+                    // Right was second → both sides done at this angle
+                    if (scanAngleDegrees >= 120) {
+                        finishLineReached = true;
+                        setState(ST_STOP);
+                    } else {
+                        scanAngleDegrees += 30;
+                        scanPhase = 0;
+                        scanStartTime = now;
+                        // scanFirstDir <= 0 means left-first, so next cycle starts left
+                        setState(ST_SCAN_LEFT);
+                    }
+                }
+            }
         }
         break;
+        }
 
+        // ────────── PERMANENT STOP (FINISH LINE) ──────────
         case ST_STOP:
         stopMotors();
-        if (L == 1 || R == 1) setState(ST_FOLLOW);
+        if (finishLineReached) {
+            // Permanent stop — robot is done. No restart.
+            break;
+        }
+        // Only restart if NOT a finish line stop
+        if (L == 1 || R == 1) {
+            debounceCount = 0;
+            setState(ST_FOLLOW);
+        }
         break;
     }
 
@@ -516,10 +670,13 @@
     // Debug logging (comment out for competition to save CPU cycles)
     static unsigned long lastLog = 0;
     if (now - lastLog > 100) {
-        Serial.printf("ST:%d L:%d R:%d DIR:%d RT:%d LOST:%d\n",
-                    state, L, R, lastKnownDir, recentTurn, lineIsLost);
+        Serial.printf("ST:%d L:%d R:%d DIR:%d RT:%d LOST:%d LSENS:%d\n",
+                    state, L, R, lastKnownDir, recentTurn, lineIsLost, lastSensorDetected);
         lastLog = now;
     }
+
+    // Reduced delay for faster responsiveness (1ms instead of 3ms)
+    //delay(1);
     }
 
     /*================================================================
@@ -616,3 +773,5 @@
     *  ST_STOP ──→ Dead stop (auto-restarts if line detected)
     *
     *================================================================*/
+
+    
