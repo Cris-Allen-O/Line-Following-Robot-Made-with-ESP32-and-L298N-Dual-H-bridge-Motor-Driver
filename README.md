@@ -3,7 +3,7 @@
 
 This is a Line following robot
 
-Details about the project is written in the "LineFollowingRobotCode.ino" file 
+Details about the project is written in the "LineFollowingRobotCode.ino" file as a comment.
 
 Made with the Components: 
 1. 1x ESP32 
