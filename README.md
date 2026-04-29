@@ -4,14 +4,15 @@
 This is a Line following robot
 
 Made with the Components: 
-1. 1x ESP32, 2x IR-sensor 
-2. 2x 18650-battery 
-3. Battery-holder 
-4. 2WD(wheel drive) 
-5. Rotating front wheel
-6. Chassis (the robot)
-7. L298N dual H-bridge motor driver 
-8. connecting wires: female to female and male to female
+1. 1x ESP32 
+2. 2x IR-sensor 
+3. 2x 18650-battery 
+4. Battery-holder 
+5. 2WD(wheel drive) 
+6. Rotating front wheel
+7. Chassis (the robot)
+8. L298N dual H-bridge motor driver 
+9. connecting wires: female to female and male to female
 
 
 
