@@ -3,6 +3,8 @@
 
 This is a Line following robot
 
+Details about the project is written in the "LineFollowingRobotCode.ino" file 
+
 Made with the Components: 
 1. 1x ESP32 
 2. 2x IR-sensor 
@@ -13,6 +15,5 @@ Made with the Components:
 7. Chassis (the robot)
 8. L298N dual H-bridge motor driver 
 9. connecting wires: female to female and male to female
-
 
 
